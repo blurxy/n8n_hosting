@@ -1,0 +1,11 @@
+# Copy to .dev.vars for local `wrangler dev` testing.
+# Never commit .dev.vars — it's in .gitignore.
+# For production, use `wrangler secret put <NAME>` instead.
+
+PLAID_CLIENT_ID=
+PLAID_SECRET=
+PLAID_ACCESS_TOKEN_CHASE=
+PLAID_ACCESS_TOKEN_CAPITAL_ONE=
+PLAID_ACCESS_TOKEN_SYNCHRONY=
+NOTION_TOKEN=
+PLAID_WEBHOOK_VERIFICATION_KEY_ID=

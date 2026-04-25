@@ -1,0 +1,204 @@
+{
+  "name": "Plaid → Notion Transactions Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Every 6 hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Load persisted cursors per institution from workflow static data.\n// First run: cursors are empty strings, Plaid returns ALL historical transactions.\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.cursors) staticData.cursors = {};\n\nconst institutions = [\n  { name: 'chase', access_token_cred: 'PLAID_ACCESS_TOKEN_CHASE' },\n  { name: 'capital_one', access_token_cred: 'PLAID_ACCESS_TOKEN_CAPITAL_ONE' },\n  { name: 'synchrony', access_token_cred: 'PLAID_ACCESS_TOKEN_SYNCHRONY' }\n];\n\nreturn institutions.map(inst => ({\n  json: {\n    institution: inst.name,\n    access_token_cred: inst.access_token_cred,\n    cursor: staticData.cursors[inst.name] || ''\n  }\n}));"
+      },
+      "id": "build-institution-list",
+      "name": "Build institution list",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://production.plaid.com/transactions/sync",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"client_id\": \"{{ $env.PLAID_CLIENT_ID }}\",\n  \"secret\": \"{{ $env.PLAID_SECRET }}\",\n  \"access_token\": \"{{ $env[$json.access_token_cred] }}\",\n  \"cursor\": \"{{ $json.cursor }}\",\n  \"count\": 500\n}",
+        "options": {}
+      },
+      "id": "plaid-sync",
+      "name": "Plaid /transactions/sync",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Persist the new cursor for each institution so next run only gets new changes.\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.cursors) staticData.cursors = {};\n\nconst incoming = $input.all();\nconst institutions = ['chase', 'capital_one', 'synchrony'];\n\nconst rowsToUpsert = [];\nconst rowsToDelete = [];\n\nincoming.forEach((batch, idx) => {\n  const instName = institutions[idx];\n  const data = batch.json;\n\n  // Save cursor for next run\n  if (data.next_cursor) {\n    staticData.cursors[instName] = data.next_cursor;\n  }\n\n  // Added + modified → upsert\n  const touched = [...(data.added || []), ...(data.modified || [])];\n  touched.forEach(tx => rowsToUpsert.push({ json: { ...tx, __institution: instName, __op: 'upsert' } }));\n\n  // Removed → delete from Notion\n  (data.removed || []).forEach(tx => rowsToDelete.push({ json: { transaction_id: tx.transaction_id, __op: 'delete' } }));\n});\n\nreturn [...rowsToUpsert, ...rowsToDelete];"
+      },
+      "id": "merge-and-save-cursor",
+      "name": "Merge results + persist cursor",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map one Plaid transaction → Notion property payload.\n// Only runs on 'upsert' items; delete items passed through untouched.\nconst tx = $json;\nif (tx.__op === 'delete') return [{ json: tx }];\n\n// --- Account mapping: fill in real Plaid account_id values after linking ---\nconst accountMap = {\n  'PLAID_ACCOUNT_ID_CHASE_CHECKING': 'Chase Checking',\n  'PLAID_ACCOUNT_ID_CHASE_AUTO': 'Chase Auto',\n  'PLAID_ACCOUNT_ID_CHASE_FREEDOM': 'Chase Freedom',\n  'PLAID_ACCOUNT_ID_CAPITAL_ONE_PLATINUM': 'Capital One Platinum',\n  'PLAID_ACCOUNT_ID_CAPITAL_ONE_QUICKSILVER': 'Capital One Quicksilver',\n  'PLAID_ACCOUNT_ID_SYNCHRONY_AMAZON': 'Synchrony Amazon'\n};\nconst friendlyAccount = accountMap[tx.account_id] || 'Uncategorized';\n\n// Plaid convention: amount > 0 = money leaving the account (expense).\n//                   amount < 0 = money entering (income/refund).\nconst isIncome = tx.amount < 0;\nconst type = tx.pending ? 'Expense' : (isIncome ? 'Income' : 'Expense');\n\n// Map Plaid PFC (personal_finance_category.primary) → our Notion categories\nconst pfcMap = {\n  'FOOD_AND_DRINK': 'Food & Drink',\n  'GENERAL_MERCHANDISE': 'Shopping',\n  'TRANSPORTATION': 'Transportation',\n  'TRAVEL': 'Travel',\n  'ENTERTAINMENT': 'Entertainment',\n  'RENT_AND_UTILITIES': 'Utilities',\n  'MEDICAL': 'Medical',\n  'PERSONAL_CARE': 'Personal Care',\n  'GENERAL_SERVICES': 'Subscriptions',\n  'INCOME': 'Paycheck',\n  'TRANSFER_IN': 'Transfer',\n  'TRANSFER_OUT': 'Transfer',\n  'LOAN_PAYMENTS': 'Credit Card Payment',\n  'BANK_FEES': 'Fees & Interest'\n};\nconst pfc = tx.personal_finance_category?.primary;\nlet category = pfcMap[pfc] || 'Uncategorized';\n\n// Groceries heuristic — Plaid buckets grocery under FOOD_AND_DRINK but the detailed tag distinguishes\nif (tx.personal_finance_category?.detailed === 'FOOD_AND_DRINK_GROCERIES') category = 'Groceries';\nif (tx.personal_finance_category?.detailed?.includes('GAS')) category = 'Gas';\n\nreturn [{\n  json: {\n    __op: 'upsert',\n    transaction_id: tx.transaction_id,\n    notion_properties: {\n      'Name': tx.merchant_name || tx.name || 'Unknown',\n      'Amount': tx.amount,\n      'Date': { start: tx.date },\n      'Type': type,\n      'Category': category,\n      'Account': friendlyAccount,\n      'Status': tx.pending ? 'Pending' : 'Posted',\n      'Merchant': tx.merchant_name || '',\n      'Plaid Transaction ID': tx.transaction_id,\n      'Plaid Account ID': tx.account_id\n    }\n  }\n}];"
+      },
+      "id": "transform",
+      "name": "Transform Plaid → Notion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 400]
+    },
+    {
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "getAll",
+        "databaseId": "={{ $env.NOTION_TRANSACTIONS_DB_ID }}",
+        "returnAll": false,
+        "limit": 1,
+        "filterType": "manual",
+        "matchType": "anyFilter",
+        "filters": {
+          "conditions": [
+            {
+              "key": "Plaid Transaction ID|rich_text",
+              "condition": "equals",
+              "richTextValue": "={{ $json.transaction_id }}"
+            }
+          ]
+        }
+      },
+      "id": "check-existing",
+      "name": "Check if row exists in Notion",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [1340, 400],
+      "credentials": {
+        "notionApi": { "id": "1", "name": "Notion account" }
+      },
+      "notesInFlow": true,
+      "notes": "Returns at most 1 row. If empty → create. If found → update that row by its page id."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ]
+        }
+      },
+      "id": "branch-upsert",
+      "name": "Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1560, 400]
+    },
+    {
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "create",
+        "databaseId": "={{ $env.NOTION_TRANSACTIONS_DB_ID }}",
+        "title": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Name }}",
+        "propertiesUi": {
+          "propertyValues": [
+            { "key": "Amount|number", "numberValue": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Amount }}" },
+            { "key": "Date|date", "date": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Date.start }}" },
+            { "key": "Type|select", "selectValue": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Type }}" },
+            { "key": "Category|select", "selectValue": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Category }}" },
+            { "key": "Account|select", "selectValue": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Account }}" },
+            { "key": "Status|select", "selectValue": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Status }}" },
+            { "key": "Merchant|rich_text", "textContent": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Merchant }}" },
+            { "key": "Plaid Transaction ID|rich_text", "textContent": "={{ $('Transform Plaid → Notion').item.json.notion_properties['Plaid Transaction ID'] }}" },
+            { "key": "Plaid Account ID|rich_text", "textContent": "={{ $('Transform Plaid → Notion').item.json.notion_properties['Plaid Account ID'] }}" }
+          ]
+        }
+      },
+      "id": "notion-create",
+      "name": "Create in Notion",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [1780, 300],
+      "credentials": {
+        "notionApi": { "id": "1", "name": "Notion account" }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": "={{ $json.id }}",
+        "propertiesUi": {
+          "propertyValues": [
+            { "key": "Amount|number", "numberValue": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Amount }}" },
+            { "key": "Status|select", "selectValue": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Status }}" },
+            { "key": "Date|date", "date": "={{ $('Transform Plaid → Notion').item.json.notion_properties.Date.start }}" }
+          ]
+        }
+      },
+      "id": "notion-update",
+      "name": "Update existing in Notion",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [1780, 500],
+      "credentials": {
+        "notionApi": { "id": "1", "name": "Notion account" }
+      }
+    }
+  ],
+  "connections": {
+    "Every 6 hours": {
+      "main": [[{ "node": "Build institution list", "type": "main", "index": 0 }]]
+    },
+    "Build institution list": {
+      "main": [[{ "node": "Plaid /transactions/sync", "type": "main", "index": 0 }]]
+    },
+    "Plaid /transactions/sync": {
+      "main": [[{ "node": "Merge results + persist cursor", "type": "main", "index": 0 }]]
+    },
+    "Merge results + persist cursor": {
+      "main": [[{ "node": "Transform Plaid → Notion", "type": "main", "index": 0 }]]
+    },
+    "Transform Plaid → Notion": {
+      "main": [[{ "node": "Check if row exists in Notion", "type": "main", "index": 0 }]]
+    },
+    "Check if row exists in Notion": {
+      "main": [[{ "node": "Exists?", "type": "main", "index": 0 }]]
+    },
+    "Exists?": {
+      "main": [
+        [{ "node": "Update existing in Notion", "type": "main", "index": 0 }],
+        [{ "node": "Create in Notion", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "1",
+  "triggerCount": 1,
+  "tags": []
+}

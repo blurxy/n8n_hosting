@@ -1,0 +1,23 @@
+name = "plaid-notion-sync"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Nightly reconciliation sweep at 1:00 AM EST (06:00 UTC).
+# Catches anything Plaid's webhook might have missed and flips late-posting
+# pending transactions to Posted status.
+[triggers]
+crons = ["0 6 * * *"]
+
+# KV namespace for storing Plaid cursors per institution.
+# Create this with:  wrangler kv:namespace create "SYNC_STATE"
+# Then paste the returned `id` here.
+[[kv_namespaces]]
+binding = "SYNC_STATE"
+id = "PLACEHOLDER_REPLACE_AFTER_wrangler_kv_create"
+
+# Non-secret configuration. Secrets (Plaid secret, Notion token, access tokens)
+# are set separately via `wrangler secret put`.
+[vars]
+NOTION_DATABASE_ID = "2975ea12-ab23-4685-b792-ad880c53f6c8"
+PLAID_ENV = "production"  # one of: sandbox | development | production

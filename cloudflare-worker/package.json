@@ -1,0 +1,17 @@
+{
+  "name": "plaid-notion-sync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Real-time Plaid webhook → Notion transactions sync, running on Cloudflare Workers",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260101.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.90.0"
+  }
+}
