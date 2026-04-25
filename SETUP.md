@@ -1,150 +1,227 @@
 # Plaid → Notion Real-Time Budget Sync — Setup
 
-Platform: **Cloudflare Workers** (free tier). Webhook-driven, near-real-time. Nightly cron as a safety net. Zero local resource usage.
+Platform: **Cloudflare Workers** (free tier). Webhook-driven, near-real-time.
+Nightly cron as a safety net. Zero local resource usage.
 
 ## What's already done
+
 - Notion "Transactions" database: https://www.notion.so/2975ea12ab234685b792ad880c53f6c8
-  - Database ID: `2975ea12-ab23-4685-b792-ad880c53f6c8` (already in `wrangler.toml`)
-- Worker source code: `cloudflare-worker/src/` (index.ts, plaid.ts, notion.ts, types.ts)
+  (Database ID `2975ea12-ab23-4685-b792-ad880c53f6c8`, already in `wrangler.toml`)
+- Worker source: `cloudflare-worker/src/` (index.ts, plaid.ts, notion.ts, types.ts)
+- Worker dependencies installed (`npm install` already run)
+- Helper script `cloudflare-worker/scripts/link-bank.sh` that mints a Plaid access
+  token via Hosted Link and stores it as a Cloudflare secret in one shot
 - Old n8n workflow JSON is kept as a reference fallback — ignore unless you switch platforms
 
-## Your manual steps
+## Steps you do manually
 
-### 1. Get credentials
-You need:
-- **Plaid** `client_id` and `secret` (Production) — from https://dashboard.plaid.com/team/keys
-- **Plaid access tokens** for each of your 3 institutions — from Plaid Link flow (one-time OAuth)
-  - Chase (Auto + Freedom + Checking)
-  - Capital One (Platinum + Quicksilver)
-  - Synchrony (Amazon)
-- **Notion Internal Integration Token** — from https://notion.so/my-integrations
-  - Then: open the Transactions database → `···` → Connections → add your integration
+The whole thing is ~10 commands plus three browser logins (one per bank).
 
-### 2. Install Wrangler and log in
+### 1. Get credentials (browser)
+
+**Plaid** — https://dashboard.plaid.com/team/keys
+Copy your **Production** `client_id` and `secret`. (If Production is not yet
+unlocked, you can run the entire flow against `sandbox.plaid.com` first to verify
+the worker logic — see "Sandbox path" at the bottom.)
+
+**Notion** — https://notion.so/my-integrations
+- Click **+ New integration**, name it "Plaid Sync", copy the secret token.
+- Open the Transactions database → `···` → **Connections** → add your integration.
+  (Skipping this makes every Notion API call return 404.)
+
+### 2. Cloudflare login
+
 ```bash
 cd cloudflare-worker
-npm install
 npx wrangler login
 ```
-This opens a browser to auth with your Cloudflare account (free, no CC needed for Workers free plan).
+Opens a browser. Free Cloudflare account, no credit card required.
 
 ### 3. Create the KV namespace
-Stores Plaid cursors between runs.
+
 ```bash
 npx wrangler kv:namespace create "SYNC_STATE"
 ```
-Copy the `id` from the output and paste into `wrangler.toml` where it says `PLACEHOLDER_REPLACE_AFTER_wrangler_kv_create`.
+Copy the `id` from the output. Open `wrangler.toml`, replace
+`PLACEHOLDER_REPLACE_AFTER_wrangler_kv_create` with that id.
 
-### 4. Set secrets
-Run each of these and paste the value when prompted (values never appear on screen or in shell history):
+### 4. Set the three baseline secrets
+
+Run each, paste the value when prompted (values are not echoed):
+
 ```bash
 npx wrangler secret put PLAID_CLIENT_ID
 npx wrangler secret put PLAID_SECRET
-npx wrangler secret put PLAID_ACCESS_TOKEN_CHASE
-npx wrangler secret put PLAID_ACCESS_TOKEN_CAPITAL_ONE
-npx wrangler secret put PLAID_ACCESS_TOKEN_SYNCHRONY
 npx wrangler secret put NOTION_TOKEN
 ```
 
+(The three Plaid `ACCESS_TOKEN_*` secrets are set automatically by the helper
+script in step 6.)
+
 ### 5. Deploy
+
 ```bash
 npx wrangler deploy
 ```
-Output will include your worker URL, e.g.:
-```
-https://plaid-notion-sync.<your-subdomain>.workers.dev
-```
-**Copy this URL** — it's your Plaid webhook endpoint.
 
-### 6. Register the webhook with Plaid
-Two options:
+Output ends with your worker URL, e.g.
+`https://plaid-notion-sync.<your-subdomain>.workers.dev`. **Copy it.**
 
-**A) Per-item (recommended for existing links):**
+### 6. Mint Plaid access tokens via Hosted Link (per bank)
+
+Set Plaid creds + your worker URL as env vars in your shell:
+
 ```bash
-curl -X POST https://production.plaid.com/item/webhook/update \
-  -H "Content-Type: application/json" \
-  -d '{
-    "client_id": "YOUR_CLIENT_ID",
-    "secret": "YOUR_SECRET",
-    "access_token": "ACCESS_TOKEN_FOR_CHASE",
-    "webhook": "https://plaid-notion-sync.<your-subdomain>.workers.dev"
-  }'
+export PLAID_CLIENT_ID="paste_your_client_id"
+export PLAID_SECRET="paste_your_production_secret"
+export WORKER_URL="https://plaid-notion-sync.<your-subdomain>.workers.dev"
 ```
-Repeat for Capital One and Synchrony access tokens.
 
-**B) Default for the whole account:**
-Set default webhook URL in Plaid Dashboard → Team Settings → Webhooks. New Link flows will auto-use this.
+Then run the helper once per bank:
+
+```bash
+./scripts/link-bank.sh PLAID_ACCESS_TOKEN_CHASE
+./scripts/link-bank.sh PLAID_ACCESS_TOKEN_CAPITAL_ONE
+./scripts/link-bank.sh PLAID_ACCESS_TOKEN_SYNCHRONY
+```
+
+Each run prints a Hosted Link URL. Open it, log into the bank in your browser,
+return to the terminal, press Enter. The script then exchanges the public_token
+for an access_token, stores it as a Worker secret, and (because `WORKER_URL`
+was exported) tells Plaid to send transaction webhooks to your worker.
+
+The script also prints each `item_id` — keep these in a notepad. They're useful
+if you ever need to check or update a specific bank link.
 
 ### 7. First sync
-- Cursors are empty on first run, so Plaid returns your full transaction history (up to 2 years)
-- Either wait for a real transaction to trigger the webhook, or force it immediately:
-  ```bash
-  curl -X POST https://sandbox.plaid.com/sandbox/item/fire_webhook \
-    -H "Content-Type: application/json" \
-    -d '{"client_id":"...","secret":"...","access_token":"...","webhook_code":"SYNC_UPDATES_AVAILABLE"}'
-  ```
-- Watch it run live:
-  ```bash
-  npx wrangler tail
-  ```
-- Check Notion — rows should appear
 
-### 8. Fill in the account mapping
-Open `src/notion.ts`. After first sync, grab the real Plaid `account_id` values from the worker logs (or call `/accounts/get`) and fill in `ACCOUNT_MAP`:
+Cursors are empty on the first run, so Plaid returns up to 2 years of history.
+Either wait for a real transaction or force a sync immediately:
+
+```bash
+# In one terminal: stream live logs
+npx wrangler tail
+```
+
+```bash
+# In another terminal: poke each item once to fire the webhook
+curl -sX POST https://sandbox.plaid.com/sandbox/item/fire_webhook \
+  -H "Content-Type: application/json" \
+  -d '{"client_id":"'$PLAID_CLIENT_ID'","secret":"'$PLAID_SECRET'","access_token":"<one-of-your-3-tokens>","webhook_code":"SYNC_UPDATES_AVAILABLE"}'
+```
+(`fire_webhook` only works in Sandbox. In Production, make a small purchase or
+wait — the nightly 1 AM EST cron will catch up otherwise.)
+
+In the `tail` window you should see lines like:
+```
+[chase] added=N modified=0 removed=0
+```
+Then check Notion → the rows appear.
+
+### 8. Fill in the account map
+
+After the first sync, scan the `tail` logs for the real Plaid `account_id`
+values. Open `cloudflare-worker/src/notion.ts`, find `ACCOUNT_MAP`, fill it:
+
 ```ts
 const ACCOUNT_MAP: Record<string, string> = {
   "abc123...": "Chase Freedom",
   "def456...": "Chase Auto",
-  "ghi789...": "Capital One Platinum",
-  // etc.
+  "ghi789...": "Chase Checking",
+  "jkl012...": "Capital One Platinum",
+  "mno345...": "Capital One Quicksilver",
+  "pqr678...": "Synchrony Amazon",
 };
 ```
-Redeploy: `npx wrangler deploy`.
+
+Redeploy:
+```bash
+npx wrangler deploy
+```
+
+## Sandbox path (optional, for testing the wiring before going live)
+
+If you want to dry-run the whole pipeline with fake data first:
+
+```bash
+# Use sandbox secret instead of production secret
+export PLAID_CLIENT_ID="your_client_id"
+export PLAID_SECRET="your_sandbox_secret"   # different from production secret
+export PLAID_ENV="sandbox"
+export WORKER_URL="https://plaid-notion-sync.<your-subdomain>.workers.dev"
+
+./scripts/link-bank.sh PLAID_ACCESS_TOKEN_CHASE
+# In the browser flow, log in with username "user_good", password "pass_good"
+```
+
+The worker will receive sandbox webhooks, sync sandbox transactions to Notion,
+prove the loop end-to-end. When you're ready for real data, unset
+`PLAID_ENV` (or set to `production`), re-run the helper for each bank with
+production credentials, and you're live.
 
 ## How it works
 
-- **Webhook path**: Plaid posts to your worker when new/modified/removed transactions exist. Worker ACKs in <100ms, then runs `/transactions/sync` and upserts to Notion via `ctx.waitUntil()`.
-- **Cron path**: 1 AM EST nightly sweep hits all three institutions as a safety net. Same code path as webhook.
-- **Idempotency**: Each Notion row is keyed by `Plaid Transaction ID`. Upsert = query by that field → PATCH if found, POST if not.
-- **Cursor**: Persisted per-institution in KV. Only advances after successful Notion writes, so failures auto-retry on next trigger.
+- **Webhook path:** Plaid POSTs to your worker on transaction changes. Worker
+  ACKs in <100ms via `ctx.waitUntil()`, then runs `/transactions/sync` and
+  upserts to Notion in the background.
+- **Cron path:** 1 AM EST nightly sweep over all 3 institutions as a safety net.
+  Same code path as the webhook handler.
+- **Idempotency:** Each Notion row is keyed by `Plaid Transaction ID`. Upsert
+  logic = query that field → PATCH if found, POST if not.
+- **Cursor:** Persisted per-institution in KV. Only advances after successful
+  Notion writes, so a transient failure auto-retries on the next trigger.
 
 ## Common commands
+
 ```bash
-npx wrangler dev              # local dev server (uses .dev.vars for secrets)
-npx wrangler deploy           # push to production
-npx wrangler tail             # stream live logs
-npx wrangler kv:key list --binding=SYNC_STATE   # see stored cursors
-npx wrangler secret list      # see which secrets are set (not values)
+npx wrangler dev                                  # local dev (uses .dev.vars)
+npx wrangler deploy                               # push to production
+npx wrangler tail                                 # stream live logs
+npx wrangler kv:key list --binding=SYNC_STATE     # see stored cursors
+npx wrangler secret list                          # see which secrets are set
 ```
 
 ## Troubleshooting
 
-**"No institution found for item_id=..."** — The item_id doesn't match any of your 3 access tokens. Check that all three `PLAID_ACCESS_TOKEN_*` secrets are set correctly.
+**"No institution found for item_id=..."** — The `item_id` doesn't match any of
+your 3 access tokens. Check that all three `PLAID_ACCESS_TOKEN_*` secrets are
+set (`npx wrangler secret list`).
 
-**"Notion /pages failed: 404"** — The Notion integration isn't connected to the database. Open the DB → `···` → Connections → add your integration.
+**"Notion /pages failed: 404"** — The Notion integration isn't connected to the
+database. Open the DB → `···` → Connections → add your integration.
 
-**"Account is 'Uncategorized' for everything"** — `ACCOUNT_MAP` in `src/notion.ts` is still empty. Fill it with real Plaid `account_id` values and redeploy.
+**"Account is 'Uncategorized' for everything"** — `ACCOUNT_MAP` in
+`src/notion.ts` is still empty. Fill it with real Plaid `account_id` values
+from the worker logs and redeploy.
 
-**Pending transactions stuck in Pending** — Plaid fires another webhook when pending → posted transitions happen. If your webhook URL was down or misconfigured during that event, the nightly cron (1 AM EST) will catch it.
+**Pending transactions stuck in Pending** — Plaid fires another webhook when
+pending → posted transitions happen. If your webhook URL was down or
+misconfigured during that event, the nightly cron will catch it.
 
-**Plaid webhook verification** — Currently disabled for simplicity. For production hardening, implement JWT verification using Plaid's `/webhook_verification_key/get` endpoint + the `Plaid-Verification` header.
+**Plaid webhook signature verification** — Currently disabled for simplicity.
+For production hardening, implement JWT verification using Plaid's
+`/webhook_verification_key/get` endpoint and the `Plaid-Verification` header.
 
 ## Cost
+
 - Cloudflare Workers free plan: 100k requests/day, 10ms CPU/request
-- You'll use maybe 20-50 webhook requests/day + 1 cron trigger = **~$0.00/month**
+- Expect ~20-50 webhook requests/day + 1 cron trigger = **~$0.00/month**
 - KV free plan: 100k reads, 1k writes/day — you'll use ~5 writes/day
 
 ## Files
+
 ```
 cloudflare-worker/
 ├── package.json
-├── wrangler.toml        (worker config + cron)
+├── wrangler.toml         (worker config + cron)
 ├── tsconfig.json
 ├── .gitignore
-├── .dev.vars.example    (template for local secrets)
+├── .dev.vars.example     (template for local secrets)
+├── scripts/
+│   └── link-bank.sh      (Hosted Link helper — mints access_token + sets secret)
 └── src/
-    ├── index.ts         (webhook + scheduled handlers)
-    ├── plaid.ts         (Plaid API calls + cursor management)
-    ├── notion.ts        (Notion upsert by transaction_id)
-    └── types.ts         (Env + Plaid type definitions)
+    ├── index.ts          (webhook + scheduled handlers)
+    ├── plaid.ts          (Plaid API calls + cursor management)
+    ├── notion.ts         (Notion upsert by transaction_id)
+    └── types.ts          (Env + Plaid type definitions)
 ```

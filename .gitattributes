@@ -1,0 +1,2 @@
+# Shell scripts must keep Unix line endings on Windows so bash doesn't choke on \r.
+*.sh text eol=lf
