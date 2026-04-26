@@ -14,10 +14,13 @@ crons = ["0 6 * * *"]
 # Then paste the returned `id` here.
 [[kv_namespaces]]
 binding = "SYNC_STATE"
-id = "PLACEHOLDER_REPLACE_AFTER_wrangler_kv_create"
+id = "5c511c070bf345d9b195520b18a5ea19"
 
 # Non-secret configuration. Secrets (Plaid secret, Notion token, access tokens)
 # are set separately via `wrangler secret put`.
 [vars]
-NOTION_DATABASE_ID = "2975ea12-ab23-4685-b792-ad880c53f6c8"
+# Data source under the "Transactions" database (the database has two data
+# sources; this is the one with our schema). Notion API >= 2025-09-03 requires
+# the data source id, not the database id, for queries and page creation.
+NOTION_DATA_SOURCE_ID = "28e06a50-4ec0-46c7-8896-6c1e60c7995f"
 PLAID_ENV = "production"  # one of: sandbox | development | production

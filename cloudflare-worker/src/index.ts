@@ -5,11 +5,18 @@ import type { Env, PlaidWebhookBody } from "./types";
 async function runSyncForInstitution(
   env: Env,
   inst: (typeof INSTITUTIONS)[number],
+  opts: { primeOnly?: boolean } = {},
 ): Promise<void> {
   const { added, modified, removed } = await syncInstitution(env, inst);
   console.log(
-    `[${inst}] added=${added.length} modified=${modified.length} removed=${removed.length}`,
+    `[${inst}] added=${added.length} modified=${modified.length} removed=${removed.length}${opts.primeOnly ? " (prime-only)" : ""}`,
   );
+
+  if (opts.primeOnly) {
+    // Cursor was already advanced inside syncInstitution; skip the Notion writes
+    // so we don't blow Cloudflare's per-invocation subrequest budget on backfill.
+    return;
+  }
 
   await upsertBatch(env, [...added, ...modified]);
   for (const txId of removed) {
@@ -41,6 +48,13 @@ export default {
       return new Response("ignored", { status: 200 });
     }
 
+    // ?prime=1 advances the cursor to "now" without writing any of the returned
+    // transactions to Notion. Used once per institution on first deploy so the
+    // unbounded historical backfill (up to 2 years) doesn't exceed CF's
+    // per-invocation subrequest limit. After this, /transactions/sync only
+    // returns deltas and the worker handles them in stride.
+    const primeOnly = new URL(req.url).searchParams.get("prime") === "1";
+
     // ACK Plaid within their 10s window, do the actual work after returning.
     ctx.waitUntil(
       (async () => {
@@ -50,14 +64,14 @@ export default {
           return;
         }
         try {
-          await runSyncForInstitution(env, inst);
+          await runSyncForInstitution(env, inst, { primeOnly });
         } catch (err) {
           console.error(`Sync failed for ${inst}:`, err);
         }
       })(),
     );
 
-    return new Response("accepted", { status: 202 });
+    return new Response(primeOnly ? "primed" : "accepted", { status: 202 });
   },
 
   // ----- Nightly reconciliation sweep -----

@@ -1,7 +1,9 @@
 import type { Env, PlaidTransaction } from "./types";
 
 const NOTION_API = "https://api.notion.com/v1";
-const NOTION_VERSION = "2022-06-28";
+// 2025-09-03 introduced multi-data-source databases. Required because our
+// Transactions DB has more than one data source under the same database id.
+const NOTION_VERSION = "2025-09-03";
 
 // Plaid account_id → friendly name. After first webhook, grab real IDs from
 // Plaid's /accounts/get response (or the webhook logs) and fill these in.
@@ -90,7 +92,7 @@ async function findPageByTxId(
 ): Promise<string | null> {
   const resp = await notionFetch(
     env,
-    `/databases/${env.NOTION_DATABASE_ID}/query`,
+    `/data_sources/${env.NOTION_DATA_SOURCE_ID}/query`,
     {
       method: "POST",
       body: JSON.stringify({
@@ -121,7 +123,7 @@ export async function upsertTransaction(
     await notionFetch(env, `/pages`, {
       method: "POST",
       body: JSON.stringify({
-        parent: { database_id: env.NOTION_DATABASE_ID },
+        parent: { data_source_id: env.NOTION_DATA_SOURCE_ID },
         properties,
       }),
     });

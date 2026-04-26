@@ -10,7 +10,7 @@ export interface Env {
   PLAID_WEBHOOK_VERIFICATION_KEY_ID?: string;
 
   NOTION_TOKEN: string;
-  NOTION_DATABASE_ID: string;
+  NOTION_DATA_SOURCE_ID: string;
 }
 
 export interface PlaidTransaction {
